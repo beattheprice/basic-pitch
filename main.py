@@ -1,56 +1,52 @@
-import os, tempfile, traceback, asyncio, numpy as np
+import os, tempfile, traceback, asyncio
 from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-# ── Load and WARM UP the model at startup ─────────────────────────────────────
-print("Importing Basic Pitch…")
-from basic_pitch.inference import predict
-from basic_pitch import ICASSP_2022_MODEL_PATH
-import tensorflow as tf
-
-print("Loading TF model…")
-_MODEL = tf.saved_model.load(str(ICASSP_2022_MODEL_PATH))
-
-# Warm-up: run a silent 1-second buffer so the first real request is fast
-print("Warming up model…")
-_SILENCE = np.zeros(22050, dtype=np.float32)
-_SILENCE_PATH = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-import soundfile as sf
-sf.write(_SILENCE_PATH.name, _SILENCE, 22050)
-predict(_SILENCE_PATH.name, _MODEL)
-os.unlink(_SILENCE_PATH.name)
+# ── Load madmom processors once at startup (numpy-only, no TensorFlow) ────────
+print("Loading madmom piano transcription model…")
+from madmom.features.notes import (
+    RNNPianoNoteProcessor,
+    NotePeakPickingProcessor,
+)
+NOTE_PROC   = RNNPianoNoteProcessor()
+NOTE_PICKER = NotePeakPickingProcessor(threshold=0.35, fps=100)
 print("Model ready ✓")
 
-# ──────────────────────────────────────────────────────────────────────────────
 app = FastAPI(title="MusicianLearner Note Extraction API")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
-executor = ThreadPoolExecutor(max_workers=1)
+app.add_middleware(
+    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+)
+executor = ThreadPoolExecutor(max_workers=2)
 
 
-def _predict(tmp_path: str):
-    _, _, note_events = predict(tmp_path, _MODEL)
+def _transcribe(tmp_path: str):
+    # activations → (time, pitch) activity matrix
+    activations = NOTE_PROC(tmp_path)
+    # peak picking → array of [onset_s, midi_note, duration_s]
+    raw_notes   = NOTE_PICKER(activations)
+
     notes = []
-    for _, row in note_events.iterrows():
-        midi     = int(row["pitch_midi"])
+    for row in raw_notes:
+        onset    = float(row[0])
+        midi     = int(row[1])
+        duration = float(row[2]) if len(row) > 2 else 0.25
         freq     = 440.0 * (2.0 ** ((midi - 69) / 12.0))
-        onset    = float(row["start_time_s"])
-        duration = float(row["end_time_s"]) - onset
-        velocity = float(row.get("velocity", 64))
         notes.append({
             "frequency":  round(freq, 4),
             "onset":      round(onset, 4),
             "duration":   round(max(duration, 0.05), 4),
-            "confidence": round(min(velocity / 127.0, 1.0), 4),
+            "confidence": 0.9,
             "midiNote":   midi,
         })
+
     total = max((n["onset"] + n["duration"]) for n in notes) if notes else 0.0
     return notes, round(total, 3)
 
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model": "loaded"}
+    return {"status": "ok", "engine": "madmom"}
 
 
 @app.post("/extract")
@@ -60,8 +56,8 @@ async def extract_notes(file: UploadFile):
         tmp.write(await file.read())
         tmp_path = tmp.name
     try:
-        loop   = asyncio.get_event_loop()
-        notes, duration = await loop.run_in_executor(executor, _predict, tmp_path)
+        loop = asyncio.get_event_loop()
+        notes, duration = await loop.run_in_executor(executor, _transcribe, tmp_path)
     except Exception:
         tb = traceback.format_exc()
         print(f"[ERROR]\n{tb}")
