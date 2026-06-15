@@ -15,52 +15,77 @@ app.add_middleware(
 )
 executor = ThreadPoolExecutor(max_workers=2)
 
-# Supported audio extensions — .audio is treated as .wav
-AUDIO_EXTS = {".mp3", ".m4a", ".aac", ".wav", ".ogg", ".flac"}
-
-
-def _parse_notes(note_events) -> list:
-    """Handle both DataFrame and list formats that Basic Pitch may return."""
-    notes = []
-
-    if hasattr(note_events, "iterrows"):
-        # DataFrame format
-        for _, row in note_events.iterrows():
-            midi     = int(row["pitch_midi"])
-            onset    = float(row["start_time_s"])
-            duration = float(row["end_time_s"]) - onset
-            velocity = float(row.get("velocity", 64))
-            freq     = 440.0 * (2.0 ** ((midi - 69) / 12.0))
-            notes.append({
-                "frequency":  round(freq, 4),
-                "onset":      round(onset, 4),
-                "duration":   round(max(duration, 0.05), 4),
-                "confidence": round(min(velocity / 127.0, 1.0), 4),
-                "midiNote":   midi,
-            })
-    else:
-        # List format: each item is (start_time, end_time, pitch_midi, amplitude, ...)
-        for event in note_events:
-            onset    = float(event[0])
-            end_time = float(event[1])
-            midi     = int(event[2])
-            amplitude = float(event[3]) if len(event) > 3 else 0.5
-            duration = end_time - onset
-            freq     = 440.0 * (2.0 ** ((midi - 69) / 12.0))
-            notes.append({
-                "frequency":  round(freq, 4),
-                "onset":      round(onset, 4),
-                "duration":   round(max(duration, 0.05), 4),
-                "confidence": round(min(amplitude, 1.0), 4),
-                "midiNote":   midi,
-            })
-
-    return notes
+# Piano MIDI range
+MIDI_MIN = 21   # A0
+MIDI_MAX = 108  # C8
+MAX_NOTES = 500
 
 
 def _transcribe(tmp_path: str):
-    _, _, note_events = predict(tmp_path, ICASSP_2022_MODEL_PATH)
-    notes = _parse_notes(note_events)
+    _, _, note_events = predict(
+        tmp_path,
+        ICASSP_2022_MODEL_PATH,
+        onset_threshold=0.6,        # higher = fewer false-positive note starts
+        frame_threshold=0.4,        # higher = only keep sustained notes
+        minimum_note_length=80,     # drop anything shorter than 80 ms
+        minimum_frequency=27.5,     # A0 (lowest piano key)
+        maximum_frequency=4186.0,   # C8 (highest piano key)
+    )
+
+    raw = []
+
+    if hasattr(note_events, "iterrows"):
+        for _, row in note_events.iterrows():
+            raw.append((
+                float(row["start_time_s"]),
+                float(row["end_time_s"]),
+                int(row["pitch_midi"]),
+                float(row.get("velocity", 64)),
+            ))
+    else:
+        for event in note_events:
+            raw.append((
+                float(event[0]),
+                float(event[1]),
+                int(event[2]),
+                float(event[3]) * 127 if len(event) > 3 else 64.0,
+            ))
+
+    # ── Post-process: remove very short notes, clamp to piano range ──────────
+    MIN_DURATION = 0.08  # 80 ms
+    filtered = [
+        e for e in raw
+        if (e[1] - e[0]) >= MIN_DURATION
+        and MIDI_MIN <= e[2] <= MIDI_MAX
+    ]
+
+    # Sort by onset then keep only the loudest note per 50ms window (dedup)
+    filtered.sort(key=lambda e: e[0])
+    deduped = []
+    last_onset = -1.0
+    last_midi  = -1
+    for e in filtered:
+        onset, _, midi, vel = e
+        if onset - last_onset < 0.05 and midi == last_midi:
+            continue  # skip near-duplicate
+        deduped.append(e)
+        last_onset = onset
+        last_midi  = midi
+
+    # Cap total notes
+    final = deduped[:MAX_NOTES]
+
+    notes = []
+    for onset, end, midi, velocity in final:
+        freq = 440.0 * (2.0 ** ((midi - 69) / 12.0))
+        notes.append({
+            "frequency":  round(freq, 4),
+            "onset":      round(onset, 4),
+            "duration":   round(max(end - onset, 0.05), 4),
+            "confidence": round(min(velocity / 127.0, 1.0), 4),
+            "midiNote":   midi,
+        })
+
     total = max((n["onset"] + n["duration"]) for n in notes) if notes else 0.0
     return notes, round(total, 3)
 
@@ -72,14 +97,11 @@ def health():
 
 @app.post("/extract")
 async def extract_notes(file: UploadFile):
-    filename = file.filename or "audio.wav"
-    ext = os.path.splitext(filename)[1].lower()
+    suffix = os.path.splitext(file.filename or "audio.wav")[1].lower()
+    if suffix not in {".mp3", ".m4a", ".aac", ".wav", ".ogg", ".flac"}:
+        suffix = ".wav"
 
-    # Treat unknown/missing extension as wav (covers Android's .audio)
-    if ext not in AUDIO_EXTS:
-        ext = ".wav"
-
-    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
         tmp.write(await file.read())
         tmp_path = tmp.name
 
@@ -97,4 +119,4 @@ async def extract_notes(file: UploadFile):
     if not notes:
         raise HTTPException(status_code=422, detail="No notes detected.")
 
-    return {"notes": notes, "durationSeconds": duration}
+    return {"notes": notes, "durationSeconds": duration, "total": len(notes)}
