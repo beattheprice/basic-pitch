@@ -1,7 +1,7 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
-basic-pitch==0.3.3
-tensorflow-cpu==2.15.0
-soundfile==0.12.1
+basic-pitch[onnx]==0.3.3
+onnxruntime==1.17.3
 numpy==1.26.4
+soundfile==0.12.1
 python-multipart==0.0.9
