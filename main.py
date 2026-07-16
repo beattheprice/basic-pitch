@@ -19,6 +19,7 @@ executor = ThreadPoolExecutor(max_workers=2)
 MIDI_MIN = 21   # A0
 MIDI_MAX = 108  # C8
 MAX_NOTES = 500
+MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB — matches musician-api/config.php and the client-side check
 
 
 def _transcribe(tmp_path: str):
@@ -97,21 +98,32 @@ def health():
 
 @app.post("/extract")
 async def extract_notes(file: UploadFile):
+    contents = await file.read()
+    if len(contents) > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large (max {MAX_FILE_SIZE // (1024*1024)}MB)",
+        )
+
     suffix = os.path.splitext(file.filename or "audio.wav")[1].lower()
     if suffix not in {".mp3", ".m4a", ".aac", ".wav", ".ogg", ".flac"}:
         suffix = ".wav"
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(await file.read())
+        tmp.write(contents)
         tmp_path = tmp.name
+    del contents  # free the in-memory copy before the memory-heavy inference step
 
     try:
         loop = asyncio.get_event_loop()
         notes, duration = await loop.run_in_executor(executor, _transcribe, tmp_path)
     except Exception:
         tb = traceback.format_exc()
-        print(f"[ERROR]\n{tb}")
-        raise HTTPException(status_code=500, detail=tb)
+        print(f"[ERROR]\n{tb}")  # full traceback stays in Railway's own logs for debugging
+        raise HTTPException(
+            status_code=422,
+            detail="Couldn't process this audio file. It may be corrupted or in an unsupported format — try a different recording, or use On-Device extraction.",
+        )
     finally:
         try: os.unlink(tmp_path)
         except OSError: pass
