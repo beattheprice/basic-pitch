@@ -8,3 +8,10 @@ services:
     envVars:
       - key: PORT
         value: 10000
+      # Render's free tier has 512MB RAM -- measured empirically to be too
+      # tight for 2 concurrent Basic Pitch inferences (crashes). Serialize
+      # requests instead; the client-side maxFileSizeMB cap in servers.php
+      # keeps individual requests small enough to fit in the remaining
+      # headroom after the model itself loads.
+      - key: MAX_WORKERS
+        value: "1"

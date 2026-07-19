@@ -23,7 +23,7 @@ app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
 )
 
-MAX_WORKERS = 2
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "2"))  # low-memory free tiers override this to 1
 executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
 # Tracks concurrent in-flight /extract requests so /health can report real load.

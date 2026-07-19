@@ -1,5 +1,10 @@
 # Hugging Face Spaces (Docker SDK)
 
+> **UPDATE (checked live): no longer free.** As of 2026, Docker/Gradio
+> Spaces on compute require a PRO subscription ($9/mo) — only Static
+> Spaces (no server code) remain free. Not viable for this use case
+> without paying. Left here for reference only; not in servers.php.
+
 1. Create a free account at huggingface.co if you don't have one.
 2. In the browser: New → Space → name it (e.g. `musicianlearner-basic-pitch`)
    → SDK: **Docker** → Hardware: **CPU basic (free)** → Create Space.

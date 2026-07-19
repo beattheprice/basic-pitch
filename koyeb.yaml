@@ -18,6 +18,10 @@ services:
     env:
       - key: PORT
         value: "8000"
+      # Koyeb's free (Eco) tier is also 512MB RAM -- same constraint as
+      # Render, measured empirically. Serialize requests.
+      - key: MAX_WORKERS
+        value: "1"
     scaling:
       min: 0
       max: 1
