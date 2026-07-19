@@ -22,6 +22,7 @@ app = FastAPI(title="MusicianLearner Note Extraction API")
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
 )
+
 MAX_WORKERS = 2
 executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 
@@ -30,12 +31,9 @@ executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
 # the executor call below), so no lock is needed.
 in_flight = 0
 
-# Piano MIDI range
-MIDI_MIN = 21   # A0
-MIDI_MAX = 108  # C8
-MAX_NOTES = 500
-MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB — matches musician-api/config.php and the client-side check
-
+MAX_FILE_SIZE  = 50 * 1024 * 1024  # 50MB — matches musician-api/config.php and the client-side check
+MAX_NOTES      = 500               # hard cap — protects Firestore doc size + client rendering
+DEDUP_WINDOW_S = 0.05              # merge same-pitch notes whose onsets fall within 50ms
 
 def _transcribe(tmp_path: str):
     _, _, note_events = predict(
@@ -44,66 +42,61 @@ def _transcribe(tmp_path: str):
         onset_threshold=0.6,        # higher = fewer false-positive note starts
         frame_threshold=0.4,        # higher = only keep sustained notes
         minimum_note_length=80,     # drop anything shorter than 80 ms
-        minimum_frequency=27.5,     # A0 (lowest piano key)
-        maximum_frequency=4186.0,   # C8 (highest piano key)
     )
 
-    raw = []
-
+    # NOTE: note_events' shape depends on the backend. TensorFlow's predict()
+    # returns a pandas DataFrame (supports .iterrows()); ONNX's returns a plain
+    # list of tuples (onset, offset, midi_pitch, amplitude[, ...]). Since we
+    # deliberately force the ONNX backend above, handle both shapes so this
+    # doesn't silently break again if the backend ever changes.
+    parsed = []
     if hasattr(note_events, "iterrows"):
         for _, row in note_events.iterrows():
-            raw.append((
-                float(row["start_time_s"]),
-                float(row["end_time_s"]),
-                int(row["pitch_midi"]),
-                float(row.get("velocity", 64)),
-            ))
+            midi  = int(row["pitch_midi"])
+            onset = float(row["start_time_s"])
+            dur   = float(row["end_time_s"]) - onset
+            conf  = float(row.get("velocity", 64)) / 127.0
+            parsed.append((midi, onset, dur, conf))
     else:
         for event in note_events:
-            raw.append((
-                float(event[0]),
-                float(event[1]),
-                int(event[2]),
-                float(event[3]) * 127 if len(event) > 3 else 64.0,
-            ))
+            midi  = int(event[2])
+            onset = float(event[0])
+            dur   = float(event[1]) - onset
+            conf  = float(event[3]) if len(event) > 3 else 0.5  # ONNX amplitude is already 0-1
+            parsed.append((midi, onset, dur, conf))
 
-    # ── Post-process: remove very short notes, clamp to piano range ──────────
-    MIN_DURATION = 0.08  # 80 ms
-    filtered = [
-        e for e in raw
-        if (e[1] - e[0]) >= MIN_DURATION
-        and MIDI_MIN <= e[2] <= MIDI_MAX
+    raw_notes = [
+        {
+            "frequency":  round(440.0 * (2.0 ** ((midi - 69) / 12.0)), 4),
+            "onset":      round(onset, 4),
+            "duration":   round(max(dur, 0.05), 4),
+            "confidence": round(min(conf, 1.0), 4),
+            "midiNote":   midi,
+        }
+        for midi, onset, dur, conf in parsed
     ]
 
-    # Sort by onset then keep only the loudest note per 50ms window (dedup)
-    filtered.sort(key=lambda e: e[0])
+    # Deduplicate near-identical notes: same pitch, onset within DEDUP_WINDOW_S —
+    # keep whichever has higher confidence. Dense/long recordings can otherwise
+    # produce thousands of near-duplicate frame-level detections.
+    raw_notes.sort(key=lambda n: n["onset"])
     deduped = []
-    last_onset = -1.0
-    last_midi  = -1
-    for e in filtered:
-        onset, _, midi, vel = e
-        if onset - last_onset < 0.05 and midi == last_midi:
-            continue  # skip near-duplicate
-        deduped.append(e)
-        last_onset = onset
-        last_midi  = midi
+    for n in raw_notes:
+        if (deduped and deduped[-1]["midiNote"] == n["midiNote"]
+                and (n["onset"] - deduped[-1]["onset"]) < DEDUP_WINDOW_S):
+            if n["confidence"] > deduped[-1]["confidence"]:
+                deduped[-1] = n
+            continue
+        deduped.append(n)
 
-    # Cap total notes
-    final = deduped[:MAX_NOTES]
+    # Hard cap — keep the highest-confidence notes, restore chronological order
+    if len(deduped) > MAX_NOTES:
+        deduped.sort(key=lambda n: n["confidence"], reverse=True)
+        deduped = deduped[:MAX_NOTES]
+        deduped.sort(key=lambda n: n["onset"])
 
-    notes = []
-    for onset, end, midi, velocity in final:
-        freq = 440.0 * (2.0 ** ((midi - 69) / 12.0))
-        notes.append({
-            "frequency":  round(freq, 4),
-            "onset":      round(onset, 4),
-            "duration":   round(max(end - onset, 0.05), 4),
-            "confidence": round(min(velocity / 127.0, 1.0), 4),
-            "midiNote":   midi,
-        })
-
-    total = max((n["onset"] + n["duration"]) for n in notes) if notes else 0.0
-    return notes, round(total, 3)
+    duration = max((n["onset"] + n["duration"]) for n in deduped) if deduped else 0.0
+    return deduped, round(duration, 3)
 
 
 @app.get("/health")
@@ -139,7 +132,7 @@ async def extract_notes(file: UploadFile):
         notes, duration = await loop.run_in_executor(executor, _transcribe, tmp_path)
     except Exception:
         tb = traceback.format_exc()
-        print(f"[ERROR]\n{tb}")  # full traceback stays in Railway's own logs for debugging
+        print(f"[ERROR]\n{tb}")  # full traceback stays in server logs for debugging
         raise HTTPException(
             status_code=422,
             detail="Couldn't process this audio file. It may be corrupted or in an unsupported format — try a different recording, or use On-Device extraction.",
