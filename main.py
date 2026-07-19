@@ -4,7 +4,16 @@ from fastapi import FastAPI, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from basic_pitch.inference import predict
-from basic_pitch import ICASSP_2022_MODEL_PATH
+from basic_pitch import build_icassp_2022_model_path, FilenameSuffix
+
+# IMPORTANT: basic_pitch's auto-detected ICASSP_2022_MODEL_PATH picks a
+# backend by priority (TF > CoreML > TFLite > ONNX) and always prefers
+# TensorFlow when it's importable — which it always is here, since
+# tensorflow is an unconditional dependency of basic-pitch itself, not
+# something the [onnx] extra removes. Build the ONNX path explicitly so
+# inference actually runs on onnxruntime instead of silently falling back
+# to the much heavier TF SavedModel (the original source of the OOM crash).
+ICASSP_2022_MODEL_PATH = build_icassp_2022_model_path(FilenameSuffix.onnx)
 
 print(f"Basic Pitch model path: {ICASSP_2022_MODEL_PATH}")
 print("Server ready ✓")
@@ -13,7 +22,13 @@ app = FastAPI(title="MusicianLearner Note Extraction API")
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
 )
-executor = ThreadPoolExecutor(max_workers=2)
+MAX_WORKERS = 2
+executor = ThreadPoolExecutor(max_workers=MAX_WORKERS)
+
+# Tracks concurrent in-flight /extract requests so /health can report real load.
+# Only ever mutated from the async event-loop thread (increment/decrement around
+# the executor call below), so no lock is needed.
+in_flight = 0
 
 # Piano MIDI range
 MIDI_MIN = 21   # A0
@@ -93,7 +108,10 @@ def _transcribe(tmp_path: str):
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    # "idle" = at least one worker free right now; "busy" = all workers occupied.
+    # The client uses this to pick which server to route a request to.
+    status = "busy" if in_flight >= MAX_WORKERS else "idle"
+    return {"status": status, "inFlight": in_flight, "maxWorkers": MAX_WORKERS}
 
 
 @app.post("/extract")
@@ -114,6 +132,8 @@ async def extract_notes(file: UploadFile):
         tmp_path = tmp.name
     del contents  # free the in-memory copy before the memory-heavy inference step
 
+    global in_flight
+    in_flight += 1
     try:
         loop = asyncio.get_event_loop()
         notes, duration = await loop.run_in_executor(executor, _transcribe, tmp_path)
@@ -125,6 +145,7 @@ async def extract_notes(file: UploadFile):
             detail="Couldn't process this audio file. It may be corrupted or in an unsupported format — try a different recording, or use On-Device extraction.",
         )
     finally:
+        in_flight -= 1
         try: os.unlink(tmp_path)
         except OSError: pass
 
