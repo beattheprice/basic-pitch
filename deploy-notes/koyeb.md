@@ -1,5 +1,11 @@
 # Koyeb
 
+> **UPDATE (checked live, Jul 2026): no longer viable.** Koyeb was
+> acquired by Mistral AI (Feb 2026). New signups can only choose Pro plan
+> and above — the free Starter tier is closed to new accounts. Existing
+> accounts are unaffected, but that doesn't help a fresh deploy. Not in
+> servers.php. Revisit only if this policy changes.
+
 **Easiest path — dashboard, no CLI needed:**
 1. Free account at koyeb.com (GitHub login works).
 2. Create Service → GitHub → select `beattheprice/basic-pitch` →
